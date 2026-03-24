@@ -26,18 +26,19 @@ var requirementsTxt []byte
 
 // Manager handles the lifecycle of the embedded Python bot subprocess.
 type Manager struct {
-	log     *zap.Logger
-	cmd     *exec.Cmd
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	workDir string
-	stopped bool
+	log      *zap.Logger
+	cmd      *exec.Cmd
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	workDir  string
+	siteDir  string // --target dir where kurigram is installed
+	pyExe    string // single resolved Python executable, used for both pip and running
+	stopped  bool
 }
 
 var instance *Manager
 
 // Start extracts bot.py, installs dependencies, and launches the Python bot.
-// It is called once from run.go after Go bot initialisation.
 func Start(log *zap.Logger) {
 	log = log.Named("PyBot")
 	m := &Manager{log: log}
@@ -55,7 +56,15 @@ func Stop() {
 // ── internal ──────────────────────────────────────────────────────────────────
 
 func (m *Manager) run() {
-	// Write bot.py and requirements.txt next to the binary
+	// Resolve Python executable ONCE — same binary used for pip + running
+	pyExe, err := resolvePython()
+	if err != nil {
+		m.log.Error("Python not found on PATH — skipping Python UI bot", zap.Error(err))
+		return
+	}
+	m.pyExe = pyExe
+	m.log.Sugar().Infof("Using Python: %s", pyExe)
+
 	workDir, err := m.extractFiles()
 	if err != nil {
 		m.log.Error("Failed to extract Python bot files", zap.Error(err))
@@ -63,13 +72,20 @@ func (m *Manager) run() {
 	}
 	m.workDir = workDir
 
-	// Install Python dependencies once
-	if err := m.installDeps(workDir); err != nil {
+	// Install deps into workDir/site-packages so PYTHONPATH can point there
+	siteDir := filepath.Join(workDir, "site-packages")
+	if err := os.MkdirAll(siteDir, 0o755); err != nil {
+		m.log.Error("Failed to create site-packages dir", zap.Error(err))
+		return
+	}
+	m.siteDir = siteDir
+
+	if err := m.installDeps(workDir, siteDir); err != nil {
 		m.log.Error("Failed to install Python dependencies", zap.Error(err))
 		return
 	}
 
-	// Restart loop — if Python bot crashes, restart after a short delay
+	// Restart loop
 	for {
 		m.mu.Lock()
 		if m.stopped {
@@ -79,7 +95,7 @@ func (m *Manager) run() {
 		m.mu.Unlock()
 
 		m.log.Info("Starting Python UI bot subprocess")
-		if err := m.launch(workDir); err != nil {
+		if err := m.launch(workDir, siteDir); err != nil {
 			m.log.Error("Python bot exited with error", zap.Error(err))
 		}
 
@@ -96,56 +112,51 @@ func (m *Manager) run() {
 }
 
 func (m *Manager) extractFiles() (string, error) {
-	// Write alongside the running binary
 	exe, err := os.Executable()
 	if err != nil {
 		exe = "."
 	}
-	dir := filepath.Dir(exe)
-	pyDir := filepath.Join(dir, "pybot")
+	pyDir := filepath.Join(filepath.Dir(exe), "pybot")
 	if err := os.MkdirAll(pyDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir pybot: %w", err)
 	}
-
-	botPath := filepath.Join(pyDir, "bot.py")
-	if err := os.WriteFile(botPath, botPySource, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pyDir, "bot.py"), botPySource, 0o644); err != nil {
 		return "", fmt.Errorf("write bot.py: %w", err)
 	}
-
-	reqPath := filepath.Join(pyDir, "requirements.txt")
-	if err := os.WriteFile(reqPath, requirementsTxt, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pyDir, "requirements.txt"), requirementsTxt, 0o644); err != nil {
 		return "", fmt.Errorf("write requirements.txt: %w", err)
 	}
-
 	m.log.Sugar().Infof("Python bot files extracted to %s", pyDir)
 	return pyDir, nil
 }
 
-func (m *Manager) installDeps(workDir string) error {
-	m.log.Info("Installing Python dependencies (kurigram)...")
-	pip := findPython("-m", "pip")
-	cmd := exec.Command(pip[0], append(pip[1:],
-		"install", "-r", filepath.Join(workDir, "requirements.txt"), "-q")...)
+func (m *Manager) installDeps(workDir, siteDir string) error {
+	m.log.Sugar().Infof("Installing Python dependencies into %s ...", siteDir)
+
+	// Use the exact same Python binary to invoke pip, install into siteDir
+	cmd := exec.Command(m.pyExe,
+		"-m", "pip", "install",
+		"-r", filepath.Join(workDir, "requirements.txt"),
+		"--target", siteDir,   // install HERE — no ambiguity about which env
+		"--quiet",
+		"--disable-pip-version-check",
+		"--no-warn-script-location",
+	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("pip install: %w", err)
 	}
-	m.log.Info("Python dependencies installed")
+	m.log.Info("Python dependencies installed successfully")
 	return nil
 }
 
-func (m *Manager) launch(workDir string) error {
+func (m *Manager) launch(workDir, siteDir string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	py := findPython()
-	args := append(py[1:], filepath.Join(workDir, "bot.py"))
-	cmd := exec.CommandContext(ctx, py[0], args...)
+	cmd := exec.CommandContext(ctx, m.pyExe, filepath.Join(workDir, "bot.py"))
+	cmd.Env = m.buildEnv(siteDir)
 
-	// Pass all necessary env vars to the subprocess
-	cmd.Env = buildEnv()
-
-	// Stream stdout/stderr through the Go logger
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 
@@ -193,48 +204,58 @@ func (m *Manager) streamLogs(r io.Reader, isErr bool) {
 	}
 }
 
-// buildEnv builds the subprocess environment from the Go config.
-func buildEnv() []string {
+// buildEnv builds the subprocess env, critically setting PYTHONPATH to siteDir
+// so Python finds kurigram regardless of system-wide installation.
+func (m *Manager) buildEnv(siteDir string) []string {
 	cfg := config.ValueOf
-	env := os.Environ() // inherit current environment
+	env := os.Environ()
 
 	set := func(k, v string) {
-		env = append(env, k+"="+v)
+		// Remove any existing value for this key first to avoid duplicates
+		prefix := k + "="
+		filtered := env[:0]
+		for _, e := range env {
+			if !strings.HasPrefix(e, prefix) {
+				filtered = append(filtered, e)
+			}
+		}
+		env = append(filtered, k+"="+v)
+	}
+
+	// KEY FIX: prepend siteDir to PYTHONPATH so kurigram is always found
+	existing := os.Getenv("PYTHONPATH")
+	if existing != "" {
+		set("PYTHONPATH", siteDir+string(os.PathListSeparator)+existing)
+	} else {
+		set("PYTHONPATH", siteDir)
 	}
 
 	set("API_ID", fmt.Sprintf("%d", cfg.ApiID))
 	set("API_HASH", cfg.ApiHash)
 	set("BOT_TOKEN", cfg.BotToken)
 	set("HOST", cfg.Host)
+	set("PYBOT_WORKDIR", m.workDir)
 
-	// Pass ADMIN_IDS from env if set
-	if v := os.Getenv("ADMIN_IDS"); v != "" {
-		set("ADMIN_IDS", v)
+	for _, key := range []string{"ADMIN_IDS", "SUPPORT_LINK", "ABOUT_LINK", "DEVELOPER_LINK"} {
+		if v := os.Getenv(key); v != "" {
+			set(key, v)
+		}
 	}
-	if v := os.Getenv("SUPPORT_LINK"); v != "" {
-		set("SUPPORT_LINK", v)
-	}
-	if v := os.Getenv("ABOUT_LINK"); v != "" {
-		set("ABOUT_LINK", v)
-	}
-	if v := os.Getenv("DEVELOPER_LINK"); v != "" {
-		set("DEVELOPER_LINK", v)
-	}
-
-	// Tell Python bot where to store its session file
-	set("PYBOT_WORKDIR", ".")
 
 	return env
 }
 
-// findPython finds the Python 3 interpreter on PATH.
-// Returns ["python3", "-m", ...] or ["python", ...] with fallback args.
-func findPython(extraArgs ...string) []string {
+// resolvePython finds the Python 3 executable and returns its full path.
+// Returns an error if no Python is found so we can skip gracefully.
+func resolvePython() (string, error) {
 	for _, name := range []string{"python3", "python"} {
 		if path, err := exec.LookPath(name); err == nil {
-			return append([]string{path}, extraArgs...)
+			// Verify it actually works
+			out, err := exec.Command(path, "--version").Output()
+			if err == nil && strings.HasPrefix(string(out), "Python 3") {
+				return path, nil
+			}
 		}
 	}
-	// Last resort — let the OS resolve it
-	return append([]string{"python3"}, extraArgs...)
+	return "", fmt.Errorf("no Python 3 interpreter found on PATH")
 }

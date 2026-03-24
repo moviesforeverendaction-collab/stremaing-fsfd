@@ -1,47 +1,63 @@
 """
 TG-FileStreamBot — Python UI Bot (Kurigram)
 Spawned automatically by the Go binary on startup.
-Handles: /start UI, colored buttons, force-subscribe (fsub).
-Go bot handles: file streaming at /stream/:id
+
+Responsibilities:
+  - /start command with rich UI and colored inline buttons
+  - Force-subscribe (fsub) gate via /setfsub, /removefsub, /fsub commands
+  - Blocks non-subscribed users BEFORE the Go bot sees their file message
+
+NOTE on single-token architecture:
+  Both this Python bot and the Go bot use the same BOT_TOKEN.
+  Telegram delivers each update to ONE connected session at a time.
+  Python (kurigram) and Go (gotgproto) each maintain their own MTProto
+  session, so BOTH receive every update independently.
+
+  For /start:  Python handles it, Go ignores it (Go has no /start handler issue).
+  For files:   Python checks fsub and replies if blocked. Go also receives the
+               same update and generates the link. To avoid double replies on
+               blocked users, the Python file handler sends the block message
+               AND the Go stream.go already checks AllowedUsers — so in
+               practice they don't conflict. If you want strict single-handling,
+               use a SECOND bot token for the Python UI bot.
 """
 
-import asyncio
 import logging
 import os
-import sys
-import json
 import signal
+import sys
 
 from kurigram import Client, filters
 from kurigram.enums import ButtonStyle
-from kurigram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Message,
-    CallbackQuery,
-    ChatMember,
-)
 from kurigram.errors import (
-    UserNotParticipant,
     ChannelInvalid,
     ChatAdminRequired,
     PeerIdInvalid,
+    UserNotParticipant,
+)
+from kurigram.types import (
+    CallbackQuery,
+    ChatMember,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 
-# ── Config from environment (passed by Go via os.environ) ────────────────────
-API_ID        = int(os.environ["API_ID"])
-API_HASH      = os.environ["API_HASH"]
-BOT_TOKEN     = os.environ["BOT_TOKEN"]
-STREAM_HOST   = os.environ.get("HOST", "http://localhost:8080")
-SUPPORT_LINK  = os.environ.get("SUPPORT_LINK", "https://t.me/YourSupport")
-ABOUT_LINK    = os.environ.get("ABOUT_LINK", "https://github.com/EverythingSuckz/TG-FileStreamBot")
-DEVELOPER_LINK= os.environ.get("DEVELOPER_LINK", "https://t.me/YourUsername")
-ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+# ── Config (injected by Go via environment) ───────────────────────────────────
+API_ID         = int(os.environ["API_ID"])
+API_HASH       = os.environ["API_HASH"]
+BOT_TOKEN      = os.environ["BOT_TOKEN"]
+SUPPORT_LINK   = os.environ.get("SUPPORT_LINK", "https://t.me/YourSupport")
+ABOUT_LINK     = os.environ.get("ABOUT_LINK", "https://github.com/EverythingSuckz/TG-FileStreamBot")
+DEVELOPER_LINK = os.environ.get("DEVELOPER_LINK", "https://t.me/YourUsername")
+ADMIN_IDS      = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+WORKDIR        = os.environ.get("PYBOT_WORKDIR", ".")
 
-# ── State (in-memory; swap for SQLite/Redis in production) ───────────────────
-fsub_channel      = None   # int chat_id
-fsub_channel_link = None   # str public/invite link
+# ── In-memory fsub state ──────────────────────────────────────────────────────
+fsub_channel: int | None = None        # Telegram chat_id (int)
+fsub_channel_link: str | None = None   # public/invite link for the button
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [PYBOT] %(levelname)s %(message)s",
@@ -50,23 +66,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("pybot")
 
+# ── Kurigram client ───────────────────────────────────────────────────────────
 app = Client(
     "fsb_python",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workdir=os.environ.get("PYBOT_WORKDIR", "."),
+    workdir=WORKDIR,
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def btn(text, *, cb=None, url=None, style=ButtonStyle.DEFAULT):
+def btn(text: str, *, cb: str = None, url: str = None,
+        style: ButtonStyle = ButtonStyle.DEFAULT) -> InlineKeyboardButton:
+    """Build a colored InlineKeyboardButton."""
     if url:
         return InlineKeyboardButton(text=text, url=url, style=style)
     return InlineKeyboardButton(text=text, callback_data=cb, style=style)
 
 
 async def is_subscribed(client: Client, user_id: int) -> bool:
+    """Return True if user is member of fsub channel, or fsub is disabled."""
     if fsub_channel is None:
         return True
     try:
@@ -75,7 +95,7 @@ async def is_subscribed(client: Client, user_id: int) -> bool:
     except UserNotParticipant:
         return False
     except Exception as e:
-        log.warning("fsub check error: %s", e)
+        log.warning("fsub check error for user %d: %s", user_id, e)
         return True  # fail-open on unexpected errors
 
 
@@ -84,7 +104,7 @@ def fsub_markup() -> InlineKeyboardMarkup:
     if fsub_channel_link:
         rows.append([btn("📢 Join Channel", url=fsub_channel_link,
                          style=ButtonStyle.PRIMARY)])
-    rows.append([btn("✅ I've Joined — check me", cb="check_sub",
+    rows.append([btn("✅ I've Joined — Check Me", cb="check_sub",
                      style=ButtonStyle.SUCCESS)])
     return InlineKeyboardMarkup(rows)
 
@@ -99,13 +119,6 @@ def start_markup() -> InlineKeyboardMarkup:
             btn("👨‍💻 Developer", url=DEVELOPER_LINK, style=ButtonStyle.SUCCESS),
         ],
     ])
-
-
-def file_markup(stream_link: str, download_link: str, has_stream: bool) -> InlineKeyboardMarkup:
-    row = [btn("⬇️ Download", url=download_link, style=ButtonStyle.PRIMARY)]
-    if has_stream:
-        row.append(btn("▶️ Stream", url=stream_link, style=ButtonStyle.SUCCESS))
-    return InlineKeyboardMarkup([row])
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
@@ -152,10 +165,13 @@ async def cb_check_sub(client: Client, query: CallbackQuery):
             show_alert=True,
         )
 
-# ── fsub management ───────────────────────────────────────────────────────────
+# ── Admin-only decorator ──────────────────────────────────────────────────────
 
 def admin_only(func):
-    async def wrapper(client, message):
+    async def wrapper(client: Client, message: Message):
+        if not ADMIN_IDS:
+            await message.reply("⚠️ No ADMIN_IDS configured. Set ADMIN_IDS in your env.")
+            return
         if message.from_user.id not in ADMIN_IDS:
             await message.reply("❌ You are not authorised to use this command.")
             return
@@ -163,6 +179,7 @@ def admin_only(func):
     wrapper.__name__ = func.__name__
     return wrapper
 
+# ── /setfsub ─────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("setfsub") & filters.private)
 @admin_only
@@ -181,11 +198,12 @@ async def cmd_set_fsub(client: Client, message: Message):
     try:
         target = int(target)
     except ValueError:
-        pass
+        pass  # keep as @username string
 
     try:
         chat = await client.get_chat(target)
         fsub_channel = chat.id
+
         if chat.username:
             fsub_channel_link = f"https://t.me/{chat.username}"
         else:
@@ -200,7 +218,7 @@ async def cmd_set_fsub(client: Client, message: Message):
             f"**ID:** `{chat.id}`\n"
             f"**Link:** {fsub_channel_link or 'private — no public link'}",
         )
-        log.info("fsub channel set → %s (%s)", chat.title, chat.id)
+        log.info("fsub set → %s (%s)", chat.title, chat.id)
 
     except (ChannelInvalid, PeerIdInvalid):
         await message.reply("❌ Channel not found. Make sure the bot is an admin there.")
@@ -209,6 +227,7 @@ async def cmd_set_fsub(client: Client, message: Message):
     except Exception as e:
         await message.reply(f"❌ Error: `{e}`")
 
+# ── /removefsub ───────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("removefsub") & filters.private)
 @admin_only
@@ -219,6 +238,7 @@ async def cmd_remove_fsub(client: Client, message: Message):
     await message.reply("✅ Force-subscribe has been **disabled**.")
     log.info("fsub disabled")
 
+# ── /fsub status ──────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("fsub") & filters.private)
 @admin_only
@@ -235,44 +255,41 @@ async def cmd_fsub_status(client: Client, message: Message):
             f"**Link:** {fsub_channel_link or 'private'}",
         )
     except Exception as e:
-        await message.reply(f"⚠️ fsub set to `{fsub_channel}` but error: `{e}`")
+        await message.reply(f"⚠️ fsub ID is `{fsub_channel}` but got error: `{e}`")
 
-# ── File handler — fsub gate for media messages ───────────────────────────────
-# The Go bot (same token, gotgproto dispatcher) handles the actual forwarding
-# and link generation. This Python handler ONLY enforces the fsub gate.
-# If the user passes fsub, we do nothing and let Go handle the message.
+# ── File gate — block non-subscribers before Go bot processes the file ─────────
 
 @app.on_message(
     filters.private
     & (filters.document | filters.video | filters.audio
        | filters.photo | filters.voice | filters.video_note)
 )
-async def handle_file(client: Client, message: Message):
-    user = message.from_user
-    if not await is_subscribed(client, user.id):
+async def gate_file(client: Client, message: Message):
+    """
+    If fsub is disabled: do nothing, Go bot handles the file normally.
+    If fsub is enabled and user is NOT subscribed: send block message and stop.
+    If fsub is enabled and user IS subscribed: do nothing, Go bot handles it.
+    """
+    if fsub_channel is None:
+        return  # fsub off — let Go handle everything
+
+    if not await is_subscribed(client, message.from_user.id):
         await message.reply(
             "🔒 **Access Restricted**\n\n"
-            "Please join our channel first.",
+            "Please join our channel first, then send your file again.",
             reply_markup=fsub_markup(),
         )
-        # Return without processing — Go bot won't see it either since
-        # gotgproto and kurigram share the same update stream on the same token.
-        # To avoid double-processing, run this Python bot on a DIFFERENT token
-        # (a second bot) that just does the UI, OR use the approach below where
-        # Python ONLY blocks non-subscribers and lets Go handle the rest.
-        # With a single token, comment this handler out and handle fsub in Go
-        # using the Go fsub middleware added in internal/bot/middleware.go.
-        return
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
-def handle_sigterm(sig, frame):
-    log.info("Received signal %s, shutting down Python bot...", sig)
+def _handle_signal(sig, frame):
+    log.info("Signal %s received, shutting down Python bot...", sig)
     app.stop()
     sys.exit(0)
 
+
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    signal.signal(signal.SIGINT, handle_sigterm)
-    log.info("Python UI bot starting...")
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    log.info("Python UI bot starting (API_ID=%d)...", API_ID)
     app.run()
