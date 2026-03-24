@@ -24,21 +24,19 @@ var botPySource []byte
 //go:embed requirements.txt
 var requirementsTxt []byte
 
-// Manager handles the lifecycle of the embedded Python bot subprocess.
 type Manager struct {
-	log      *zap.Logger
-	cmd      *exec.Cmd
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	workDir  string
-	siteDir  string // --target dir where kurigram is installed
-	pyExe    string // single resolved Python executable, used for both pip and running
-	stopped  bool
+	log     *zap.Logger
+	cmd     *exec.Cmd
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	workDir string
+	siteDir string
+	pyExe   string
+	stopped bool
 }
 
 var instance *Manager
 
-// Start extracts bot.py, installs dependencies, and launches the Python bot.
 func Start(log *zap.Logger) {
 	log = log.Named("PyBot")
 	m := &Manager{log: log}
@@ -46,17 +44,13 @@ func Start(log *zap.Logger) {
 	go m.run()
 }
 
-// Stop gracefully terminates the Python subprocess.
 func Stop() {
 	if instance != nil {
 		instance.stop()
 	}
 }
 
-// ── internal ──────────────────────────────────────────────────────────────────
-
 func (m *Manager) run() {
-	// Resolve Python executable ONCE — same binary used for pip + running
 	pyExe, err := resolvePython()
 	if err != nil {
 		m.log.Error("Python not found on PATH — skipping Python UI bot", zap.Error(err))
@@ -72,7 +66,6 @@ func (m *Manager) run() {
 	}
 	m.workDir = workDir
 
-	// Install deps into workDir/site-packages so PYTHONPATH can point there
 	siteDir := filepath.Join(workDir, "site-packages")
 	if err := os.MkdirAll(siteDir, 0o755); err != nil {
 		m.log.Error("Failed to create site-packages dir", zap.Error(err))
@@ -85,7 +78,6 @@ func (m *Manager) run() {
 		return
 	}
 
-	// Restart loop
 	for {
 		m.mu.Lock()
 		if m.stopped {
@@ -132,12 +124,10 @@ func (m *Manager) extractFiles() (string, error) {
 
 func (m *Manager) installDeps(workDir, siteDir string) error {
 	m.log.Sugar().Infof("Installing Python dependencies into %s ...", siteDir)
-
-	// Use the exact same Python binary to invoke pip, install into siteDir
 	cmd := exec.Command(m.pyExe,
 		"-m", "pip", "install",
 		"-r", filepath.Join(workDir, "requirements.txt"),
-		"--target", siteDir,   // install HERE — no ambiguity about which env
+		"--target", siteDir,
 		"--quiet",
 		"--disable-pip-version-check",
 		"--no-warn-script-location",
@@ -153,7 +143,6 @@ func (m *Manager) installDeps(workDir, siteDir string) error {
 
 func (m *Manager) launch(workDir, siteDir string) error {
 	ctx, cancel := context.WithCancel(context.Background())
-
 	cmd := exec.CommandContext(ctx, m.pyExe, filepath.Join(workDir, "bot.py"))
 	cmd.Env = m.buildEnv(siteDir)
 
@@ -204,57 +193,68 @@ func (m *Manager) streamLogs(r io.Reader, isErr bool) {
 	}
 }
 
-// buildEnv builds the subprocess env, critically setting PYTHONPATH to siteDir
-// so Python finds kurigram regardless of system-wide installation.
+// buildEnv builds a clean env for the subprocess.
+// FIX: allocate a fresh slice instead of env[:0] which aliased the same
+// backing array and corrupted itself while iterating.
 func (m *Manager) buildEnv(siteDir string) []string {
 	cfg := config.ValueOf
-	env := os.Environ()
 
-	set := func(k, v string) {
-		// Remove any existing value for this key first to avoid duplicates
-		prefix := k + "="
-		filtered := env[:0]
-		for _, e := range env {
-			if !strings.HasPrefix(e, prefix) {
-				filtered = append(filtered, e)
-			}
-		}
-		env = append(filtered, k+"="+v)
+	// Start from a clean copy — never slice the original
+	base := os.Environ()
+
+	// overrides: key → value (applied last, wins over base)
+	overrides := map[string]string{
+		// THE critical fix: tell Python exactly where kurigram lives
+		"PYTHONPATH":   siteDir,
+		"PYBOT_SITE":   siteDir,
+		"PYBOT_WORKDIR": m.workDir,
+		"API_ID":       fmt.Sprintf("%d", cfg.ApiID),
+		"API_HASH":     cfg.ApiHash,
+		"BOT_TOKEN":    cfg.BotToken,
+		"HOST":         cfg.Host,
 	}
 
-	// KEY FIX: prepend siteDir to PYTHONPATH so kurigram is always found
-	existing := os.Getenv("PYTHONPATH")
-	if existing != "" {
-		set("PYTHONPATH", siteDir+string(os.PathListSeparator)+existing)
-	} else {
-		set("PYTHONPATH", siteDir)
-	}
-
-	set("API_ID", fmt.Sprintf("%d", cfg.ApiID))
-	set("API_HASH", cfg.ApiHash)
-	set("BOT_TOKEN", cfg.BotToken)
-	set("HOST", cfg.Host)
-	set("PYBOT_WORKDIR", m.workDir)
-
+	// Copy optional vars from parent env
 	for _, key := range []string{"ADMIN_IDS", "SUPPORT_LINK", "ABOUT_LINK", "DEVELOPER_LINK"} {
 		if v := os.Getenv(key); v != "" {
-			set(key, v)
+			overrides[key] = v
 		}
 	}
 
-	return env
+	// If PYTHONPATH already exists in the environment, prepend siteDir to it
+	for _, e := range base {
+		if strings.HasPrefix(e, "PYTHONPATH=") {
+			existing := strings.TrimPrefix(e, "PYTHONPATH=")
+			if existing != "" {
+				overrides["PYTHONPATH"] = siteDir + string(os.PathListSeparator) + existing
+			}
+			break
+		}
+	}
+
+	// Build final env: base entries not overridden + all overrides
+	result := make([]string, 0, len(base)+len(overrides))
+	for _, e := range base {
+		key := e[:strings.IndexByte(e, '=')]
+		if _, overridden := overrides[key]; !overridden {
+			result = append(result, e)
+		}
+	}
+	for k, v := range overrides {
+		result = append(result, k+"="+v)
+	}
+	return result
 }
 
-// resolvePython finds the Python 3 executable and returns its full path.
-// Returns an error if no Python is found so we can skip gracefully.
 func resolvePython() (string, error) {
 	for _, name := range []string{"python3", "python"} {
-		if path, err := exec.LookPath(name); err == nil {
-			// Verify it actually works
-			out, err := exec.Command(path, "--version").Output()
-			if err == nil && strings.HasPrefix(string(out), "Python 3") {
-				return path, nil
-			}
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		out, err := exec.Command(path, "--version").Output()
+		if err == nil && strings.HasPrefix(string(out), "Python 3") {
+			return path, nil
 		}
 	}
 	return "", fmt.Errorf("no Python 3 interpreter found on PATH")

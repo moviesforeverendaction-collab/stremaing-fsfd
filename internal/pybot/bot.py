@@ -1,32 +1,23 @@
 """
 TG-FileStreamBot — Python UI Bot (Kurigram)
-Spawned automatically by the Go binary on startup.
-
-Responsibilities:
-  - /start command with rich UI and colored inline buttons
-  - Force-subscribe (fsub) gate via /setfsub, /removefsub, /fsub commands
-  - Blocks non-subscribed users BEFORE the Go bot sees their file message
-
-NOTE on single-token architecture:
-  Both this Python bot and the Go bot use the same BOT_TOKEN.
-  Telegram delivers each update to ONE connected session at a time.
-  Python (kurigram) and Go (gotgproto) each maintain their own MTProto
-  session, so BOTH receive every update independently.
-
-  For /start:  Python handles it, Go ignores it (Go has no /start handler issue).
-  For files:   Python checks fsub and replies if blocked. Go also receives the
-               same update and generates the link. To avoid double replies on
-               blocked users, the Python file handler sends the block message
-               AND the Go stream.go already checks AllowedUsers — so in
-               practice they don't conflict. If you want strict single-handling,
-               use a SECOND bot token for the Python UI bot.
+Auto-spawned by the Go binary. Handles /start UI, colored buttons, fsub.
 """
 
-import logging
-import os
-import signal
+# ── PATH BOOTSTRAP — must be first, before any kurigram import ───────────────
+# Insert the site-packages dir Go installed kurigram into.
+# This works even if PYTHONPATH env var is not picked up for any reason.
 import sys
+import os
 
+_site = os.environ.get("PYBOT_SITE", "")
+if _site and _site not in sys.path:
+    sys.path.insert(0, _site)
+
+# ── Stdlib imports ────────────────────────────────────────────────────────────
+import logging
+import signal
+
+# ── Kurigram imports (now resolvable) ────────────────────────────────────────
 from kurigram import Client, filters
 from kurigram.enums import ButtonStyle
 from kurigram.errors import (
@@ -54,8 +45,8 @@ ADMIN_IDS      = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if 
 WORKDIR        = os.environ.get("PYBOT_WORKDIR", ".")
 
 # ── In-memory fsub state ──────────────────────────────────────────────────────
-fsub_channel: int | None = None        # Telegram chat_id (int)
-fsub_channel_link: str | None = None   # public/invite link for the button
+fsub_channel: int | None = None
+fsub_channel_link: str | None = None
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -79,14 +70,12 @@ app = Client(
 
 def btn(text: str, *, cb: str = None, url: str = None,
         style: ButtonStyle = ButtonStyle.DEFAULT) -> InlineKeyboardButton:
-    """Build a colored InlineKeyboardButton."""
     if url:
         return InlineKeyboardButton(text=text, url=url, style=style)
     return InlineKeyboardButton(text=text, callback_data=cb, style=style)
 
 
 async def is_subscribed(client: Client, user_id: int) -> bool:
-    """Return True if user is member of fsub channel, or fsub is disabled."""
     if fsub_channel is None:
         return True
     try:
@@ -96,7 +85,7 @@ async def is_subscribed(client: Client, user_id: int) -> bool:
         return False
     except Exception as e:
         log.warning("fsub check error for user %d: %s", user_id, e)
-        return True  # fail-open on unexpected errors
+        return True
 
 
 def fsub_markup() -> InlineKeyboardMarkup:
@@ -179,7 +168,7 @@ def admin_only(func):
     wrapper.__name__ = func.__name__
     return wrapper
 
-# ── /setfsub ─────────────────────────────────────────────────────────────────
+# ── /setfsub ──────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("setfsub") & filters.private)
 @admin_only
@@ -198,12 +187,11 @@ async def cmd_set_fsub(client: Client, message: Message):
     try:
         target = int(target)
     except ValueError:
-        pass  # keep as @username string
+        pass
 
     try:
         chat = await client.get_chat(target)
         fsub_channel = chat.id
-
         if chat.username:
             fsub_channel_link = f"https://t.me/{chat.username}"
         else:
@@ -257,7 +245,7 @@ async def cmd_fsub_status(client: Client, message: Message):
     except Exception as e:
         await message.reply(f"⚠️ fsub ID is `{fsub_channel}` but got error: `{e}`")
 
-# ── File gate — block non-subscribers before Go bot processes the file ─────────
+# ── File gate — block non-subscribers ────────────────────────────────────────
 
 @app.on_message(
     filters.private
@@ -265,14 +253,8 @@ async def cmd_fsub_status(client: Client, message: Message):
        | filters.photo | filters.voice | filters.video_note)
 )
 async def gate_file(client: Client, message: Message):
-    """
-    If fsub is disabled: do nothing, Go bot handles the file normally.
-    If fsub is enabled and user is NOT subscribed: send block message and stop.
-    If fsub is enabled and user IS subscribed: do nothing, Go bot handles it.
-    """
     if fsub_channel is None:
-        return  # fsub off — let Go handle everything
-
+        return  # fsub off — Go bot handles it
     if not await is_subscribed(client, message.from_user.id):
         await message.reply(
             "🔒 **Access Restricted**\n\n"
@@ -283,7 +265,7 @@ async def gate_file(client: Client, message: Message):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _handle_signal(sig, frame):
-    log.info("Signal %s received, shutting down Python bot...", sig)
+    log.info("Signal %s received, shutting down...", sig)
     app.stop()
     sys.exit(0)
 
@@ -291,5 +273,5 @@ def _handle_signal(sig, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
-    log.info("Python UI bot starting (API_ID=%d)...", API_ID)
+    log.info("Python UI bot starting (API_ID=%d, site=%s)...", API_ID, _site or "env")
     app.run()
